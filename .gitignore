@@ -1,0 +1,11 @@
+# Node
+node_modules/
+
+# Logs
+*.log
+checkin.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

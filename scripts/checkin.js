@@ -56,12 +56,12 @@ function findStoragePath() {
   const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   const found = [];
   for (const dir of CANDIDATE_DATA_DIRS) {
-    const p = path.join(appData, dir, 'User', 'globalStorage', 'storage.json');
-    if (!fs.existsSync(p)) continue;
+    const candidatePath = path.join(appData, dir, 'User', 'globalStorage', 'storage.json');
+    if (!fs.existsSync(candidatePath)) continue;
     try {
-      const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(candidatePath, 'utf8'));
       if (typeof raw[AUTH_STORAGE_KEY] === 'string' && raw[AUTH_STORAGE_KEY].length > 0) {
-        found.push({ path: p, mtime: fs.statSync(p).mtimeMs });
+        found.push({ path: candidatePath, mtime: fs.statSync(candidatePath).mtimeMs });
       }
     } catch (_) { /* 跳过损坏文件 */ }
   }
@@ -75,20 +75,20 @@ function sha512(buf) {
   return crypto.createHash('sha512').update(buf).digest();
 }
 
-function mixMaterial() {
+function buildMixMaterial() {
   const out = Buffer.alloc(ENC_MAT_LEN);
   for (let i = 0; i < ENC_MAT_LEN; i++) out[i] = MIX_A[i] ^ MIX_B[i];
   return out;
 }
 
 function decryptAuth(encB64) {
-  const t = Buffer.from(encB64, 'base64');
-  if (t.length <= ENC_HEADER_LEN + ENC_KEY_LEN) throw new Error('密文长度异常');
-  const embeddedKey = t.subarray(ENC_HEADER_LEN, ENC_HEADER_LEN + ENC_KEY_LEN);
-  const derived = sha512(Buffer.concat([sha512(embeddedKey), mixMaterial()]));
+  const cipher = Buffer.from(encB64, 'base64');
+  if (cipher.length <= ENC_HEADER_LEN + ENC_KEY_LEN) throw new Error('密文长度异常');
+  const embeddedKey = cipher.subarray(ENC_HEADER_LEN, ENC_HEADER_LEN + ENC_KEY_LEN);
+  const derived = sha512(Buffer.concat([sha512(embeddedKey), buildMixMaterial()]));
   const aesKey = derived.subarray(0, 16);
   const iv = derived.subarray(16, 32);
-  const ciphertext = t.subarray(ENC_HEADER_LEN + ENC_KEY_LEN);
+  const ciphertext = cipher.subarray(ENC_HEADER_LEN + ENC_KEY_LEN);
   const decipher = crypto.createDecipheriv('aes-128-cbc', aesKey, iv);
   const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return plain.subarray(ENC_TAG_LEN).toString('utf8');
@@ -111,50 +111,53 @@ async function postJson(url, headers) {
   }
 }
 
-function payloadOf(json) {
+// 响应结构兼容：优先取 data 子对象，无 data 时即响应本身
+function extractData(json) {
   if (json && typeof json === 'object' && json.data && typeof json.data === 'object') return json.data;
   return json || {};
 }
 
-function codeOf(json) {
+// 响应业务码：缺失视为成功（0）
+function extractCode(json) {
   if (json && json.code !== undefined && json.code !== null) return Number(json.code);
   return 0;
 }
 
 // ---------- 积分余额后缀（展示用，失败不影响签到结果） ----------
-async function balanceSuffix(headers) {
+async function formatBalanceSuffix(headers) {
   try {
-    const u = await postJson(USAGE_URL, headers);
-    const us = (u && typeof u === 'object' && u.usage_summary) || null;
-    if (us && typeof us.total_amount === 'number') {
-      const remain = Math.round((us.total_amount - (us.consumed_amount || 0)) * 100) / 100;
-      return `，账户可用积分 ${remain}`;
+    const usageRes = await postJson(USAGE_URL, headers);
+    const usageSummary = (usageRes && typeof usageRes === 'object' && usageRes.usage_summary) || null;
+    if (usageSummary && typeof usageSummary.total_amount === 'number') {
+      const remaining = Math.round((usageSummary.total_amount - (usageSummary.consumed_amount || 0)) * 100) / 100;
+      return `，账户可用积分 ${remaining}`;
     }
   } catch (_) { /* 展示性信息，忽略 */ }
   return '';
 }
 
-async function attempt(headers) {
-  const st = await postJson(STATUS_URL, headers);
-  const sc = codeOf(st);
-  if (sc !== 0) {
-    return { retry: sc === 9074, error: `查询签到状态失败 code=${sc} ${st.message || ''}`.trim() };
+// ---------- 单次签到尝试（状态查询 -> 判断 -> 领取 -> 回查确认） ----------
+async function tryCheckinOnce(headers) {
+  const statusRes = await postJson(STATUS_URL, headers);
+  const statusCode = extractCode(statusRes);
+  if (statusCode !== 0) {
+    return { retry: statusCode === 9074, error: `查询签到状态失败 code=${statusCode} ${statusRes.message || ''}`.trim() };
   }
-  const sd = payloadOf(st);
+  const statusData = extractData(statusRes);
   // 字段语义（与 TraeWork 客户端源码一致）：
   //   checked_in     账号级：本账号今日已在任意端完成签到
   //   did_checked_in 设备级：本设备今日已操作过签到
   //   credits        每日签到奖励额度（不是账户余额！）
   //   extra_credits  会员/升级每日加成额度
-  const checkedIn = sd.checked_in !== undefined ? !!sd.checked_in : false;
-  const didCheckedIn = sd.did_checked_in !== undefined ? !!sd.did_checked_in : false;
-  const reward = sd.credits;
+  const checkedIn = statusData.checked_in !== undefined ? !!statusData.checked_in : false;
+  const didCheckedIn = statusData.did_checked_in !== undefined ? !!statusData.did_checked_in : false;
+  const rewardPerDay = statusData.credits;
 
   if (checkedIn) {
-    const rw = reward !== undefined ? `（每日签到奖励 ${reward} 积分）` : '';
-    return { done: true, message: `今日已签到${rw}${await balanceSuffix(headers)}` };
+    const rewardNote = rewardPerDay !== undefined ? `（每日签到奖励 ${rewardPerDay} 积分）` : '';
+    return { done: true, message: `今日已签到${rewardNote}${await formatBalanceSuffix(headers)}` };
   }
-  if (sd.enable === false) {
+  if (statusData.enable === false) {
     return { done: true, message: '签到功能未开启（enable=false）' };
   }
   if (didCheckedIn) {
@@ -162,22 +165,22 @@ async function attempt(headers) {
     return { done: true, message: '本设备今日已签到过，账号签到需在其他端完成或明日再试' };
   }
 
-  const cl = await postJson(CLAIM_URL, headers);
-  const cc = codeOf(cl);
-  if (cc === 0) {
+  const claimRes = await postJson(CLAIM_URL, headers);
+  const claimCode = extractCode(claimRes);
+  if (claimCode === 0) {
     // claim 已签状态下会返回 code 0 但不发放积分（幂等空操作），
     // 因此必须回查状态确认真实生效
     let confirmed = false;
     try {
-      const st2 = await postJson(STATUS_URL, headers);
-      confirmed = codeOf(st2) === 0 && !!payloadOf(st2).checked_in;
+      const confirmRes = await postJson(STATUS_URL, headers);
+      confirmed = extractCode(confirmRes) === 0 && !!extractData(confirmRes).checked_in;
     } catch (_) { /* 回查失败按成功处理 */ }
     if (confirmed) {
-      return { done: true, message: `签到成功，获得 ${reward !== undefined ? reward : 100} 积分${await balanceSuffix(headers)}` };
+      return { done: true, message: `签到成功，获得 ${rewardPerDay !== undefined ? rewardPerDay : 100} 积分${await formatBalanceSuffix(headers)}` };
     }
     return { retry: true, error: 'claim 返回成功但服务器签到状态未更新，等待重试核实' };
   }
-  return { retry: cc === 9074, error: `领取积分失败 code=${cc} ${cl.message || ''}`.trim() };
+  return { retry: claimCode === 9074, error: `领取积分失败 code=${claimCode} ${claimRes.message || ''}`.trim() };
 }
 
 // ---------- 主流程 ----------
@@ -231,26 +234,26 @@ async function main() {
   if (storage['telemetry.machineId']) headers['X-Machine-Id'] = String(storage['telemetry.machineId']);
   if (storage['telemetry.devDeviceId']) headers['X-Device-Id'] = String(storage['telemetry.devDeviceId']);
 
-  for (let i = 1; i <= MAX_ATTEMPTS; i++) {
-    let r;
+  for (let attemptNo = 1; attemptNo <= MAX_ATTEMPTS; attemptNo++) {
+    let result;
     try {
-      r = await attempt(headers);
+      result = await tryCheckinOnce(headers);
     } catch (e) {
-      r = { retry: true, error: `请求异常 - ${e.message}` };
+      result = { retry: true, error: `请求异常 - ${e.message}` };
     }
-    if (r.done) {
-      log(r.message);
+    if (result.done) {
+      log(result.message);
       return;
     }
-    log(r.error);
-    if (!r.retry || i === MAX_ATTEMPTS) {
+    log(result.error);
+    if (!result.retry || attemptNo === MAX_ATTEMPTS) {
       log('ERROR: 签到失败（服务器限流时请稍后重试，定时任务会自动兜底）');
       process.exitCode = 1;
       return;
     }
-    const wait = RETRY_BASE_MS * i + Math.floor(Math.random() * 3000);
-    log(`等待 ${Math.round(wait / 1000)}s 后重试（${i}/${MAX_ATTEMPTS}）...`);
-    await new Promise((resolve) => setTimeout(resolve, wait));
+    const waitMs = RETRY_BASE_MS * attemptNo + Math.floor(Math.random() * 3000);
+    log(`等待 ${Math.round(waitMs / 1000)}s 后重试（${attemptNo}/${MAX_ATTEMPTS}）...`);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
 }
 
